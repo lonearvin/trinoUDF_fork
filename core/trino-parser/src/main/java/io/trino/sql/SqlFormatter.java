@@ -16,6 +16,7 @@ package io.trino.sql;
 import com.google.common.base.Joiner;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import io.trino.sql.tree.AddColumn;
+import io.trino.sql.tree.AddJar;
 import io.trino.sql.tree.AliasedRelation;
 import io.trino.sql.tree.AllColumns;
 import io.trino.sql.tree.Analyze;
@@ -53,6 +54,7 @@ import io.trino.sql.tree.DropCatalog;
 import io.trino.sql.tree.DropColumn;
 import io.trino.sql.tree.DropDefaultValue;
 import io.trino.sql.tree.DropFunction;
+import io.trino.sql.tree.DropJar;
 import io.trino.sql.tree.DropMaterializedView;
 import io.trino.sql.tree.DropNotNullConstraint;
 import io.trino.sql.tree.DropRole;
@@ -1564,6 +1566,22 @@ public final class SqlFormatter
                     .append(" ESCAPE ")
                     .append(formatStringLiteral(value)));
 
+            return null;
+        }
+
+        @Override
+        protected Void visitAddJar(AddJar node, Integer indent)
+        {
+            builder.append("ADD JAR ")
+                    .append(formatStringLiteral(node.getPath().getValue()));
+            return null;
+        }
+
+        @Override
+        protected Void visitDropJar(DropJar node, Integer indent)
+        {
+            builder.append("DROP JAR ")
+                    .append(node.getName().getValue());
             return null;
         }
 

@@ -24,6 +24,7 @@ import io.trino.grammar.sql.SqlBaseParser.CreateCatalogContext;
 import io.trino.grammar.sql.SqlBaseParser.DropCatalogContext;
 import io.trino.grammar.sql.SqlBaseParser.OwnedEntityKindContext;
 import io.trino.sql.tree.AddColumn;
+import io.trino.sql.tree.AddJar;
 import io.trino.sql.tree.AliasedRelation;
 import io.trino.sql.tree.AllColumns;
 import io.trino.sql.tree.AllRows;
@@ -96,6 +97,7 @@ import io.trino.sql.tree.DropCatalog;
 import io.trino.sql.tree.DropColumn;
 import io.trino.sql.tree.DropDefaultValue;
 import io.trino.sql.tree.DropFunction;
+import io.trino.sql.tree.DropJar;
 import io.trino.sql.tree.DropMaterializedView;
 import io.trino.sql.tree.DropNotNullConstraint;
 import io.trino.sql.tree.DropRole;
@@ -466,6 +468,18 @@ class AstBuilder
                 getLocation(context),
                 visitIfPresent(context.catalog, Identifier.class),
                 (Identifier) visit(context.schema));
+    }
+
+    @Override
+    public Node visitAddJar(SqlBaseParser.AddJarContext context)
+    {
+        return new AddJar(getLocation(context), (StringLiteral) visit(context.path));
+    }
+
+    @Override
+    public Node visitDropJar(SqlBaseParser.DropJarContext context)
+    {
+        return new DropJar(getLocation(context), (Identifier) visit(context.name));
     }
 
     @Override

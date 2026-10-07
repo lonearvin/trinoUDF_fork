@@ -55,6 +55,8 @@ statement
     : rootQueryWithSession                                             #statementDefault
     | USE schema=identifier                                            #use
     | USE catalog=identifier '.' schema=identifier                     #use
+    | ADD JAR path=string                                              #addJar
+    | DROP JAR name=identifier                                         #dropJar
     | CREATE CATALOG (IF NOT EXISTS)? catalog=identifier
          USING connectorName=identifier
          (COMMENT string)?
@@ -1106,7 +1108,7 @@ nonReserved
     | GRACE | GRANT | GRANTED | GRANTS | GRAPHVIZ | GROUPS
     | HOUR
     | IF | IGNORE | IMMEDIATE | INCLUDING | INITIAL | INLINE | INPUT | INTERVAL | INVOKER | IO | ITERATE | ISOLATION
-    | JSON
+    | JAR | JSON
     | KEEP | KEY | KEYS
     | LANGUAGE | LAST | LATERAL | LEADING | LEAVE | LEVEL | LIMIT | LOCAL | LOGICAL | LOOP
     | MAP | MATCH | MATCHED | MATCHES | MATCH_RECOGNIZE | MATERIALIZED | MEASURES | MERGE | MINUTE | MONTH
@@ -1252,6 +1254,7 @@ IO: 'IO';
 IS: 'IS';
 ISOLATION: 'ISOLATION';
 ITERATE: 'ITERATE';
+JAR: 'JAR';
 JOIN: 'JOIN';
 JSON: 'JSON';
 JSON_ARRAY: 'JSON_ARRAY';
