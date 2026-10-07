@@ -74,7 +74,7 @@ class BuiltinFunctionResolver
     ResolvedFunction resolveBuiltinFunction(String name, List<TypeDescriptorProvider> parameterTypes)
     {
         try {
-            return uncheckedCacheGet(functionCache, FunctionCacheKey.from(name, parameterTypes),
+            return uncheckedCacheGet(functionCache, FunctionCacheKey.from(name, parameterTypes, globalFunctionCatalog.getFunctionVersion()),
                     () -> {
                         CatalogFunctionBinding functionBinding = functionBinder.bindFunction(parameterTypes, getBuiltinFunctions(name), name);
                         return resolveBuiltin(functionBinding);
@@ -191,7 +191,7 @@ class BuiltinFunctionResolver
         }
     }
 
-    private record FunctionCacheKey(String name, List<? extends TypeDescriptor> types)
+    private record FunctionCacheKey(String name, List<? extends TypeDescriptor> types, long functionVersion)
     {
         private FunctionCacheKey
         {
@@ -199,11 +199,11 @@ class BuiltinFunctionResolver
             requireNonNull(types, "types is null");
         }
 
-        public static FunctionCacheKey from(String name, List<TypeDescriptorProvider> parameterTypes)
+        public static FunctionCacheKey from(String name, List<TypeDescriptorProvider> parameterTypes, long functionVersion)
         {
             return new FunctionCacheKey(name, parameterTypes.stream()
                     .map(TypeDescriptorProvider::getTypeDescriptor)
-                    .collect(toImmutableList()));
+                    .collect(toImmutableList()), functionVersion);
         }
     }
 }

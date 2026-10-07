@@ -14,6 +14,7 @@
 package io.trino.server;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.inject.Inject;
 import io.airlift.log.Logger;
@@ -42,6 +43,7 @@ import io.trino.spi.classloader.ThreadContextClassLoader;
 import io.trino.spi.connector.ConnectorFactory;
 import io.trino.spi.eventlistener.EventListenerFactory;
 import io.trino.spi.exchange.ExchangeManagerFactory;
+import io.trino.spi.function.FunctionId;
 import io.trino.spi.function.LanguageFunctionEngine;
 import io.trino.spi.resourcegroups.ResourceGroupConfigurationManagerFactory;
 import io.trino.spi.security.CertificateAuthenticatorFactory;
@@ -54,14 +56,19 @@ import io.trino.spi.spool.SpoolingManagerFactory;
 import io.trino.spi.type.ParametricType;
 import io.trino.spi.type.Type;
 
+import java.io.IOException;
 import java.net.URL;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static java.util.Arrays.asList;
 import static java.util.Objects.requireNonNull;
@@ -117,6 +124,7 @@ public class PluginManager
     private final BlockEncodingManager blockEncodingManager;
     private final HandleResolver handleResolver;
     private final AtomicBoolean pluginsLoading = new AtomicBoolean();
+    private final Map<String, LoadedPlugin> dynamicPlugins = new ConcurrentHashMap<>();
 
     @Inject
     public PluginManager(
@@ -205,12 +213,14 @@ public class PluginManager
     @Override
     public void installPlugin(Plugin plugin)
     {
-        installPluginInternal(plugin);
+        installPluginInternal(plugin, false);
         typeRegistry.verifyTypes();
     }
 
-    private void installPluginInternal(Plugin plugin)
+    private Set<FunctionId> installPluginInternal(Plugin plugin, boolean replaceFunctions)
     {
+        Set<FunctionId> registeredFunctionIds = new LinkedHashSet<>();
+
         catalogStoreManager.ifPresent(catalogStoreManager -> {
             for (CatalogStoreFactory catalogStoreFactory : plugin.getCatalogStoreFactories()) {
                 log.info("Registering catalog store %s", catalogStoreFactory.getName());
@@ -243,7 +253,14 @@ public class PluginManager
             log.info("Registering functions from %s", plugin.getClass().getSimpleName());
             InternalFunctionBundleBuilder builder = InternalFunctionBundle.builder();
             functions.forEach(builder::functions);
-            globalFunctionCatalog.addFunctions(builder.build());
+            InternalFunctionBundle functionBundle = builder.build();
+            if (replaceFunctions) {
+                globalFunctionCatalog.replaceFunctions(functionBundle);
+            }
+            else {
+                globalFunctionCatalog.addFunctions(functionBundle);
+            }
+            functionBundle.getFunctions().forEach(function -> registeredFunctionIds.add(function.getFunctionId()));
         }
 
         for (LanguageFunctionEngine languageFunctionEngine : plugin.getLanguageFunctionEngines()) {
@@ -304,6 +321,128 @@ public class PluginManager
             log.info("Registering spooling manager %s", spoolingManagerFactory.getName());
             spoolingManagerRegistry.addSpoolingManagerFactory(spoolingManagerFactory);
         }
+
+        return registeredFunctionIds;
+    }
+
+    /**
+     * Loads a plugin from the given URLs at runtime, without restarting the cluster.
+     * <p>
+     * The plugin gets a fresh {@link PluginClassLoader}, so a reloaded plugin never shares classes with
+     * the version it replaces. Function registration swaps the immutable function snapshot atomically,
+     * so queries that already resolved their functions keep running against the snapshot they started with.
+     *
+     * @return a handle that can be passed to {@link #uninstallPlugin} to undo the registration
+     */
+    public synchronized LoadedPlugin installPluginFromUrls(String pluginName, List<URL> urls, String checksum)
+    {
+        log.info("-- Dynamically loading plugin %s --", pluginName);
+
+        // Drop the previous version first, so a reload with a changed implementation does not leave stale functions behind
+        LoadedPlugin previous = dynamicPlugins.get(pluginName);
+        if (previous != null) {
+            globalFunctionCatalog.removeFunctions(previous.functionIds());
+        }
+
+        PluginClassLoader pluginClassLoader = createClassLoader(pluginName, urls);
+        Optional<ClassLoader> replacedClassLoader = handleResolver.replaceClassLoader(pluginClassLoader);
+        replacedClassLoader.ifPresent(_ -> log.info("Replaced class loader %s", pluginClassLoader.getId()));
+
+        Set<FunctionId> functionIds = new LinkedHashSet<>();
+        try (ThreadContextClassLoader _ = new ThreadContextClassLoader(pluginClassLoader)) {
+            ServiceLoader<Plugin> serviceLoader = ServiceLoader.load(Plugin.class, pluginClassLoader);
+            List<Plugin> plugins = ImmutableList.copyOf(serviceLoader);
+            checkState(!plugins.isEmpty(), "%s - No service providers of type %s in the classpath: %s", pluginName, Plugin.class.getName(), asList(urls));
+
+            for (Plugin plugin : plugins) {
+                log.info("Installing %s", plugin.getClass().getName());
+                functionIds.addAll(installPluginInternal(plugin, true));
+            }
+        }
+        typeRegistry.verifyTypes();
+
+        LoadedPlugin loadedPlugin = new LoadedPlugin(pluginName, pluginClassLoader, ImmutableSet.copyOf(functionIds), checksum);
+        dynamicPlugins.put(pluginName, loadedPlugin);
+        if (previous != null) {
+            releasePlugin(previous);
+        }
+
+        log.info("-- Finished dynamically loading plugin %s --", pluginName);
+        return loadedPlugin;
+    }
+
+    /**
+     * Unloads a plugin previously loaded with {@link #installPluginFromUrls}.
+     * <p>
+     * Order matters: the function snapshot is swapped first, then the class loader is unregistered and
+     * closed. Only once the last reference is gone can the JVM collect the class loader and release the
+     * Metaspace it holds. Keeping any reference alive, for example a {@code MethodHandle} cached in the
+     * function registry, pins the class loader forever.
+     */
+    public void uninstallPlugin(LoadedPlugin plugin)
+    {
+        log.info("-- Unloading plugin %s --", plugin.name());
+
+        globalFunctionCatalog.removeFunctions(plugin.functionIds());
+        releasePlugin(plugin);
+
+        log.info("-- Finished unloading plugin %s --", plugin.name());
+    }
+
+    /**
+     * Unloads the plugin registered under the given name, as used by {@code DROP JAR}.
+     */
+    public void uninstallPlugin(String pluginName)
+    {
+        checkArgument(uninstallPluginIfPresent(pluginName), "Plugin not loaded: %s", pluginName);
+    }
+
+    /**
+     * Unloads the plugin if present. This is idempotent for worker-side RPC retries.
+     *
+     * @return whether the plugin was loaded and has been unloaded
+     */
+    public synchronized boolean uninstallPluginIfPresent(String pluginName)
+    {
+        LoadedPlugin plugin = dynamicPlugins.remove(pluginName);
+        if (plugin == null) {
+            return false;
+        }
+        globalFunctionCatalog.removeFunctions(plugin.functionIds());
+        releasePlugin(plugin);
+        return true;
+    }
+
+    /**
+     * Releases the class loader of a plugin that is no longer referenced by the function registry.
+     * The functions themselves are intentionally left alone: when a plugin is replaced, the new version
+     * has already taken over the same function ids.
+     */
+    private void releasePlugin(LoadedPlugin plugin)
+    {
+        handleResolver.unregisterClassLoader(plugin.classLoader());
+        try {
+            plugin.classLoader().close();
+        }
+        catch (IOException e) {
+            log.warn(e, "Failed to close class loader for plugin %s", plugin.name());
+        }
+    }
+
+    public record LoadedPlugin(String name, PluginClassLoader classLoader, Set<FunctionId> functionIds, String checksum) {}
+
+    /**
+     * Snapshot of the plugins loaded at runtime, used to bring newly joined nodes up to date.
+     */
+    public List<LoadedPlugin> listDynamicPlugins()
+    {
+        return ImmutableList.copyOf(dynamicPlugins.values());
+    }
+
+    public Optional<String> getDynamicPluginChecksum(String pluginName)
+    {
+        LoadedPlugin plugin = dynamicPlugins.get(pluginName);
+        return plugin == null ? Optional.empty() : Optional.of(plugin.checksum());
     }
 
     public static PluginClassLoader createClassLoader(String pluginName, List<URL> urls)

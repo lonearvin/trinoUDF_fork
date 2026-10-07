@@ -18,6 +18,7 @@ import com.google.inject.Inject;
 import io.trino.server.PluginClassLoader;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -38,6 +39,33 @@ public final class HandleResolver
     {
         ClassLoader existingClassLoader = classLoaders.putIfAbsent(classLoader.getId(), classLoader);
         checkState(existingClassLoader == null, "Class loader already registered: %s", classLoader.getId());
+    }
+
+    /**
+     * Registers the class loader, replacing any class loader previously registered under the same id.
+     * Used by dynamic plugin loading, where reloading a plugin replaces its class loader.
+     *
+     * @return the class loader that was replaced, if any
+     */
+    public Optional<ClassLoader> replaceClassLoader(PluginClassLoader classLoader)
+    {
+        return Optional.ofNullable(classLoaders.put(classLoader.getId(), classLoader));
+    }
+
+    /**
+     * Removes the given class loader, if it is still the one registered under its id.
+     * <p>
+     * This is deliberately a compare-and-remove: after a plugin reload the id is taken over by the new
+     * class loader, and releasing the previous version must not unregister the new one.
+     * <p>
+     * Unloading a plugin without unregistering its class loader keeps the plugin classes reachable from
+     * this map, so the class loader, and with it the whole Metaspace of the plugin, can never be collected.
+     *
+     * @return whether the class loader was registered and has been removed
+     */
+    public boolean unregisterClassLoader(PluginClassLoader classLoader)
+    {
+        return classLoaders.remove(classLoader.getId(), classLoader);
     }
 
     public String getId(Object handle)

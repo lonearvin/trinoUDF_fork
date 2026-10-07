@@ -105,8 +105,14 @@ public class FunctionManager
 
     public ScalarFunctionImplementation getScalarFunctionImplementation(ResolvedFunction resolvedFunction, InvocationConvention invocationConvention)
     {
+        // A global cache entry stores MethodHandles which strongly reference the plugin ClassLoader.
+        // Dynamic bundles own their own short-lived specialization caches, so bypass this process-wide
+        // cache for them to let DROP JAR release the loader once in-flight queries finish.
+        if (globalFunctionCatalog.isDynamicFunction(resolvedFunction.functionId())) {
+            return getScalarFunctionImplementationInternal(resolvedFunction, invocationConvention);
+        }
         try {
-            return uncheckedCacheGet(specializedScalarCache, new FunctionKey(resolvedFunction, invocationConvention), () -> getScalarFunctionImplementationInternal(resolvedFunction, invocationConvention));
+            return uncheckedCacheGet(specializedScalarCache, new FunctionKey(resolvedFunction, invocationConvention, globalFunctionCatalog.getFunctionVersion()), () -> getScalarFunctionImplementationInternal(resolvedFunction, invocationConvention));
         }
         catch (UncheckedExecutionException e) {
             throwIfInstanceOf(e.getCause(), TrinoException.class);
@@ -161,6 +167,9 @@ public class FunctionManager
 
     public AggregationImplementation getAggregationImplementation(ResolvedFunction resolvedFunction)
     {
+        if (globalFunctionCatalog.isDynamicFunction(resolvedFunction.functionId())) {
+            return getAggregationImplementationInternal(resolvedFunction);
+        }
         try {
             return uncheckedCacheGet(specializedAggregationCache, resolvedFunction, () -> getAggregationImplementationInternal(resolvedFunction));
         }
@@ -181,6 +190,9 @@ public class FunctionManager
 
     public WindowFunctionSupplier getWindowFunctionSupplier(ResolvedFunction resolvedFunction)
     {
+        if (globalFunctionCatalog.isDynamicFunction(resolvedFunction.functionId())) {
+            return getWindowFunctionSupplierInternal(resolvedFunction);
+        }
         try {
             return uncheckedCacheGet(specializedWindowCache, resolvedFunction, () -> getWindowFunctionSupplierInternal(resolvedFunction));
         }
@@ -371,7 +383,7 @@ public class FunctionManager
         }
     }
 
-    private record FunctionKey(ResolvedFunction resolvedFunction, InvocationConvention invocationConvention)
+    private record FunctionKey(ResolvedFunction resolvedFunction, InvocationConvention invocationConvention, long functionVersion)
     {
         private FunctionKey
         {

@@ -16,6 +16,8 @@ package io.trino.metadata;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.Multimap;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.inject.Inject;
@@ -45,15 +47,19 @@ import io.trino.spi.type.TypeManager;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static io.trino.metadata.OperatorNameUtil.isOperatorName;
 import static io.trino.metadata.OperatorNameUtil.mangleOperatorName;
 import static io.trino.metadata.OperatorNameUtil.unmangleOperator;
@@ -78,6 +84,8 @@ public class GlobalFunctionCatalog
     private final Provider<TypeManager> typeManager;
     private final Provider<FunctionManager> functionManager;
     private volatile FunctionMap functions = new FunctionMap();
+    private volatile Set<FunctionId> dynamicFunctionIds = ImmutableSet.of();
+    private final AtomicLong functionVersion = new AtomicLong();
 
     @Inject
     public GlobalFunctionCatalog(Provider<Metadata> metadata, Provider<TypeManager> typeManager, Provider<FunctionManager> functionManager)
@@ -103,6 +111,61 @@ public class GlobalFunctionCatalog
             }
         }
         this.functions = new FunctionMap(this.functions, functionBundle);
+        functionVersion.incrementAndGet();
+    }
+
+    /**
+     * Registers the functions from the bundle, replacing any existing function with the same {@link FunctionId}.
+     * This is the entry point used by dynamic plugin loading, where a plugin JAR is reloaded with a new
+     * implementation while the engine keeps serving queries.
+     * <p>
+     * The swap is a single volatile write of an immutable snapshot, so a query that already resolved its
+     * functions keeps running against the snapshot it started with.
+     */
+    public final synchronized void replaceFunctions(FunctionBundle functionBundle)
+    {
+        Set<FunctionId> replaced = functionBundle.getFunctions().stream()
+                .map(FunctionMetadata::getFunctionId)
+                .filter(functions.getFunctionsById()::containsKey)
+                .collect(toImmutableSet());
+        this.functions = new FunctionMap(this.functions, replaced, functionBundle);
+        Set<FunctionId> nextDynamicFunctionIds = new java.util.HashSet<>(dynamicFunctionIds);
+        nextDynamicFunctionIds.removeAll(replaced);
+        functionBundle.getFunctions().stream()
+                .map(FunctionMetadata::getFunctionId)
+                .forEach(nextDynamicFunctionIds::add);
+        dynamicFunctionIds = ImmutableSet.copyOf(nextDynamicFunctionIds);
+        functionVersion.incrementAndGet();
+    }
+
+    /**
+     * Removes the functions with the given ids, used when a dynamically loaded plugin is unloaded.
+     * <p>
+     * Callers must make sure no in-flight query still references these functions, otherwise the query
+     * fails with an unknown function implementation error.
+     */
+    public final synchronized void removeFunctions(Collection<FunctionId> functionIds)
+    {
+        this.functions = new FunctionMap(this.functions, ImmutableSet.copyOf(functionIds), null);
+        Set<FunctionId> remainingDynamicFunctionIds = new java.util.HashSet<>(dynamicFunctionIds);
+        remainingDynamicFunctionIds.removeAll(functionIds);
+        dynamicFunctionIds = ImmutableSet.copyOf(remainingDynamicFunctionIds);
+        functionVersion.incrementAndGet();
+    }
+
+    public boolean isDynamicFunction(FunctionId functionId)
+    {
+        return dynamicFunctionIds.contains(functionId);
+    }
+
+    /**
+     * Monotonic version of the function registry, bumped whenever the registered set of functions changes.
+     * Caches keyed by function name and argument types include it, so a dynamic plugin reload invalidates
+     * them instead of serving the previous implementation.
+     */
+    public long getFunctionVersion()
+    {
+        return functionVersion.get();
     }
 
     /**
@@ -264,6 +327,51 @@ public class GlobalFunctionCatalog
                 }
             }
             this.functionsByLowerCaseName = functionsByName.build();
+
+            // Make sure all functions with the same name are aggregations or none of them are
+            for (Entry<String, Collection<FunctionMetadata>> entry : this.functionsByLowerCaseName.asMap().entrySet()) {
+                Collection<FunctionMetadata> values = entry.getValue();
+                long aggregations = values.stream()
+                        .map(FunctionMetadata::getKind)
+                        .filter(kind -> kind == AGGREGATE)
+                        .count();
+                checkState(aggregations == 0 || aggregations == values.size(), "'%s' is both an aggregation and a scalar function", entry.getKey());
+            }
+        }
+
+        /**
+         * Builds a new snapshot by first removing {@code removedIds} and then merging {@code functionBundle}.
+         * Passing an empty set and {@code null} yields an identical copy, so unregistering is just a removal.
+         */
+        public FunctionMap(FunctionMap map, Set<FunctionId> removedIds, FunctionBundle functionBundle)
+        {
+            Map<FunctionId, FunctionBundle> bundles = new LinkedHashMap<>(map.functionBundlesById);
+            Map<FunctionId, FunctionMetadata> metadata = new LinkedHashMap<>(map.functionsById);
+            Multimap<String, FunctionMetadata> byName = LinkedHashMultimap.create(map.functionsByLowerCaseName);
+
+            for (FunctionId removedId : removedIds) {
+                bundles.remove(removedId);
+                FunctionMetadata removed = metadata.remove(removedId);
+                if (removed != null) {
+                    for (String alias : removed.getNames()) {
+                        byName.remove(alias.toLowerCase(ENGLISH), removed);
+                    }
+                }
+            }
+
+            if (functionBundle != null) {
+                for (FunctionMetadata function : functionBundle.getFunctions()) {
+                    bundles.put(function.getFunctionId(), functionBundle);
+                    metadata.put(function.getFunctionId(), function);
+                    for (String alias : function.getNames()) {
+                        byName.put(alias.toLowerCase(ENGLISH), function);
+                    }
+                }
+            }
+
+            this.functionBundlesById = ImmutableMap.copyOf(bundles);
+            this.functionsById = ImmutableMap.copyOf(metadata);
+            this.functionsByLowerCaseName = ImmutableListMultimap.copyOf(byName);
 
             // Make sure all functions with the same name are aggregations or none of them are
             for (Entry<String, Collection<FunctionMetadata>> entry : this.functionsByLowerCaseName.asMap().entrySet()) {
