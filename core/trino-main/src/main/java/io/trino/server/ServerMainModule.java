@@ -348,6 +348,17 @@ public class ServerMainModule
                     }
                 }).build());
 
+        DynamicPluginConfig dynamicPluginConfig = buildConfigObject(DynamicPluginConfig.class);
+        install(internalHttpClientModule("dynamic-plugin", ForDynamicPlugin.class)
+                .withConfigDefaults(config -> {
+                    config.setIdleTimeout(new Duration(30, SECONDS));
+                    config.setRequestTimeout(dynamicPluginConfig.getWorkerTimeout());
+                }).build());
+        binder.bind(DynamicPluginAdmission.class).in(Scopes.SINGLETON);
+        binder.bind(DynamicPluginNodeReadiness.class).in(Scopes.SINGLETON);
+        binder.bind(NodeInstanceId.class).in(Scopes.SINGLETON);
+        binder.bind(DynamicPluginClusterManager.class).in(Scopes.SINGLETON);
+
         configBinder(binder).bindConfig(DirectExchangeClientConfig.class);
         binder.bind(ExchangeExecutionMBean.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ExchangeExecutionMBean.class).withGeneratedName();
@@ -432,17 +443,22 @@ public class ServerMainModule
 
         // server info resource
         jaxrsBinder(binder).bind(ServerInfoResource.class);
+        jaxrsBinder(binder).bind(DynamicPluginResource.class);
         newOptionalBinder(binder, QueryIdGenerator.class);
 
         // node status resource
         jaxrsBinder(binder).bind(StatusResource.class);
 
         // plugin manager
+        // Bind the concrete class as well, so tasks can reach the dynamic plugin loading entry points.
+        // PluginInstaller resolves to the same singleton, otherwise the dynamic plugin registry would be split in two.
+        binder.bind(PluginManager.class).in(Scopes.SINGLETON);
         newOptionalBinder(binder, PluginInstaller.class).setDefault()
-                .to(PluginManager.class).in(Scopes.SINGLETON);
+                .to(PluginManager.class);
         newOptionalBinder(binder, PluginsProvider.class).setDefault()
                 .to(ServerPluginsProvider.class).in(Scopes.SINGLETON);
         configBinder(binder).bindConfig(ServerPluginsProviderConfig.class);
+        configBinder(binder).bindConfig(DynamicPluginConfig.class);
 
         // SIMD support
         binder.bind(BlockEncodingSimdSupport.class).in(Scopes.SINGLETON);

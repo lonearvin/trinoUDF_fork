@@ -16,6 +16,7 @@ package io.trino.util;
 import com.google.common.base.VerifyException;
 import com.google.common.collect.ImmutableList;
 import io.trino.execution.AddColumnTask;
+import io.trino.execution.AddJarTask;
 import io.trino.execution.CallTask;
 import io.trino.execution.CommentTask;
 import io.trino.execution.CommitTask;
@@ -35,6 +36,7 @@ import io.trino.execution.DropCatalogTask;
 import io.trino.execution.DropColumnTask;
 import io.trino.execution.DropDefaultValueTask;
 import io.trino.execution.DropFunctionTask;
+import io.trino.execution.DropJarTask;
 import io.trino.execution.DropMaterializedViewTask;
 import io.trino.execution.DropNotNullConstraintTask;
 import io.trino.execution.DropRoleTask;
@@ -70,6 +72,7 @@ import io.trino.execution.TruncateTableTask;
 import io.trino.execution.UseTask;
 import io.trino.spi.resourcegroups.QueryType;
 import io.trino.sql.tree.AddColumn;
+import io.trino.sql.tree.AddJar;
 import io.trino.sql.tree.Analyze;
 import io.trino.sql.tree.Call;
 import io.trino.sql.tree.Comment;
@@ -93,6 +96,7 @@ import io.trino.sql.tree.DropCatalog;
 import io.trino.sql.tree.DropColumn;
 import io.trino.sql.tree.DropDefaultValue;
 import io.trino.sql.tree.DropFunction;
+import io.trino.sql.tree.DropJar;
 import io.trino.sql.tree.DropMaterializedView;
 import io.trino.sql.tree.DropNotNullConstraint;
 import io.trino.sql.tree.DropRole;
@@ -258,6 +262,8 @@ public final class StatementUtils
             .add(dataDefinitionStatement(SetProperties.class, SetPropertiesTask.class))
             .add(dataDefinitionStatement(SetTimeZone.class, SetTimeZoneTask.class))
             .add(dataDefinitionStatement(StartTransaction.class, StartTransactionTask.class))
+            .add(dataDefinitionStatement(AddJar.class, AddJarTask.class))
+            .add(dataDefinitionStatement(DropJar.class, DropJarTask.class))
             .add(dataDefinitionStatement(Use.class, UseTask.class))
             .build().stream()
             .collect(toImmutableMap(StatementTypeInfo::getStatementType, identity()));
