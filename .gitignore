@@ -37,3 +37,6 @@ core/trino-web-ui/src/main/resources/webapp-legacy/dist/
 .bun
 .claude/settings.local.json
 .claude/worktrees/
+
+# build-time JS dependencies (installed by the web-ui build, not source)
+node_modules/
