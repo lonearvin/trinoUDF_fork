@@ -65,6 +65,7 @@ public class RemoteNodeState
     private final URI infoUri;
     private final Ticker ticker;
     private final AtomicReference<InternalNode> internalNode = new AtomicReference<>();
+    private final AtomicReference<String> nodeInstanceId = new AtomicReference<>();
     private final AtomicReference<NodeState> nodeState = new AtomicReference<>(INACTIVE);
     private final AtomicBoolean hasBeenActive = new AtomicBoolean(false);
     private final AtomicReference<ListenableFuture<Boolean>> future = new AtomicReference<>();
@@ -94,6 +95,11 @@ public class RemoteNodeState
     public Optional<InternalNode> getInternalNode()
     {
         return Optional.ofNullable(internalNode.get());
+    }
+
+    public Optional<String> getNodeInstanceId()
+    {
+        return Optional.ofNullable(nodeInstanceId.get());
     }
 
     public boolean hasBeenActive()
@@ -150,6 +156,10 @@ public class RemoteNodeState
                             }
                             else {
                                 nodeState = serverInfo.state();
+                                String previousInstanceId = nodeInstanceId.getAndSet(serverInfo.nodeInstanceId());
+                                if (previousInstanceId != null && !previousInstanceId.equals(serverInfo.nodeInstanceId())) {
+                                    log.info("Node instance changed for %s: %s -> %s", serverInfo.nodeId(), previousInstanceId, serverInfo.nodeInstanceId());
+                                }
                             }
 
                             internalNode.set(new InternalNode(

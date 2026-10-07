@@ -13,6 +13,7 @@
  */
 package io.trino.sql.planner;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
 import com.google.common.collect.ImmutableList;
@@ -26,7 +27,9 @@ import io.trino.execution.scheduler.NodeScheduler;
 import io.trino.execution.scheduler.NodeSelector;
 import io.trino.metadata.Split;
 import io.trino.node.InternalNode;
+import io.trino.node.InternalNodeManager;
 import io.trino.operator.RetryPolicy;
+import io.trino.spi.Node;
 import io.trino.spi.connector.ConnectorBucketNodeMap;
 import io.trino.spi.connector.ConnectorNodePartitioningProvider;
 import io.trino.spi.connector.ConnectorPartitioningHandle;
@@ -40,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.ToIntFunction;
@@ -51,6 +55,7 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.SystemSessionProperties.getFaultTolerantExecutionMaxPartitionCount;
 import static io.trino.SystemSessionProperties.getRetryPolicy;
 import static io.trino.execution.TaskManagerConfig.MAX_WRITER_COUNT;
+import static io.trino.node.NodeState.ACTIVE;
 import static io.trino.operator.exchange.LocalExchange.SCALE_WRITERS_MAX_PARTITIONS_PER_WRITER;
 import static io.trino.spi.StandardErrorCode.NO_NODES_AVAILABLE;
 import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_HASH_DISTRIBUTION;
@@ -62,14 +67,31 @@ public class NodePartitioningManager
 {
     private final NodeScheduler nodeScheduler;
     private final CatalogServiceProvider<ConnectorNodePartitioningProvider> partitioningProvider;
+    private final InternalNodeManager nodeManager;
 
     @Inject
+    public NodePartitioningManager(
+            NodeScheduler nodeScheduler,
+            CatalogServiceProvider<ConnectorNodePartitioningProvider> partitioningProvider,
+            InternalNodeManager nodeManager)
+    {
+        this.nodeScheduler = requireNonNull(nodeScheduler, "nodeScheduler is null");
+        this.partitioningProvider = requireNonNull(partitioningProvider, "partitioningProvider is null");
+        this.nodeManager = requireNonNull(nodeManager, "nodeManager is null");
+    }
+
+    /**
+     * Test-only constructor for planning without a live cluster. Fixed connector mappings are not validated
+     * against schedulable nodes in this mode.
+     */
+    @VisibleForTesting
     public NodePartitioningManager(
             NodeScheduler nodeScheduler,
             CatalogServiceProvider<ConnectorNodePartitioningProvider> partitioningProvider)
     {
         this.nodeScheduler = requireNonNull(nodeScheduler, "nodeScheduler is null");
         this.partitioningProvider = requireNonNull(partitioningProvider, "partitioningProvider is null");
+        this.nodeManager = null;
     }
 
     public NodePartitionMap getNodePartitioningMap(Session session, PartitioningHandle partitioningHandle, int partitionCount)
@@ -116,6 +138,7 @@ public class NodePartitioningManager
             if (connectorBucketNodeMap.hasFixedMapping()) {
                 bucketToNode = getFixedMapping(connectorBucketNodeMap);
                 verify(bucketToNode.size() == connectorBucketNodeMap.getBucketCount(), "Fixed mapping size does not match bucket count");
+                verifyFixedMappingSchedulable(bucketToNode);
             }
             else {
                 List<InternalNode> allNodes = getAllNodes(session);
@@ -202,7 +225,9 @@ public class NodePartitioningManager
         ToIntFunction<Split> splitToBucket = getSplitToBucket(session, partitioningHandle, bucketCount);
 
         if (bucketNodeMap.map(ConnectorBucketNodeMap::hasFixedMapping).orElse(false)) {
-            return new BucketNodeMap(splitToBucket, getFixedMapping(bucketNodeMap.get()));
+            List<InternalNode> fixedMapping = getFixedMapping(bucketNodeMap.get());
+            verifyFixedMappingSchedulable(fixedMapping);
+            return new BucketNodeMap(splitToBucket, fixedMapping);
         }
 
         long seed = bucketNodeMap.map(ConnectorBucketNodeMap::getCacheKeyHint).orElse(ThreadLocalRandom.current().nextLong());
@@ -259,6 +284,43 @@ public class NodePartitioningManager
         return connectorBucketNodeMap.getFixedMapping().stream()
                 .map(InternalNode.class::cast)
                 .collect(toImmutableList());
+    }
+
+    /**
+     * A connector can pin buckets to specific nodes, and that mapping is used directly as the set of nodes a
+     * stage runs on. It therefore bypasses the node selector, which is where dynamic plugin readiness is
+     * enforced. Refuse the mapping while any of its nodes is not currently schedulable, instead of silently
+     * dispatching work to a worker whose plugin set has not been verified.
+     */
+    private void verifyFixedMappingSchedulable(List<InternalNode> fixedMapping)
+    {
+        if (nodeManager == null) {
+            return;
+        }
+        Set<InternalNode> schedulable = nodeManager.getNodes(ACTIVE);
+        List<InternalNode> notSchedulable = fixedMapping.stream()
+                .distinct()
+                .filter(node -> !schedulable.contains(node))
+                .collect(toImmutableList());
+        checkCondition(notSchedulable.isEmpty(),
+                NO_NODES_AVAILABLE,
+                "Fixed bucket-to-node mapping refers to nodes that are not currently schedulable: %s",
+                notSchedulable.stream().map(InternalNode::getNodeIdentifier).collect(toImmutableList()));
+    }
+
+    /**
+     * Validates a connector-supplied fixed bucket-to-node mapping before it is used to place work.
+     * <p>
+     * The fault tolerant scheduler consumes such a mapping directly from the connector, bypassing the node
+     * selector, which is where dynamic plugin readiness is enforced. Callers that use a fixed mapping outside
+     * of the methods above must run this check so work is never dispatched to a worker whose plugin set has
+     * not been verified.
+     */
+    public void checkFixedMappingSchedulable(List<? extends Node> fixedMapping)
+    {
+        verifyFixedMappingSchedulable(fixedMapping.stream()
+                .map(InternalNode.class::cast)
+                .collect(toImmutableList()));
     }
 
     public Optional<ConnectorBucketNodeMap> getConnectorBucketNodeMap(Session session, PartitioningHandle partitioningHandle)

@@ -23,6 +23,7 @@ import static java.util.Objects.requireNonNull;
 
 public record ServerInfo(
         String nodeId,
+        String nodeInstanceId,
         NodeState state,
         NodeVersion nodeVersion,
         String environment,
@@ -34,6 +35,7 @@ public record ServerInfo(
     public ServerInfo
     {
         requireNonNull(nodeId, "nodeId is null");
+        requireNonNull(nodeInstanceId, "nodeInstanceId is null");
         requireNonNull(state, "state is null");
         requireNonNull(nodeVersion, "nodeVersion is null");
         requireNonNull(environment, "environment is null");

@@ -16,6 +16,7 @@ package io.trino.node;
 import com.google.common.collect.ImmutableSet;
 import io.trino.spi.HostAddress;
 
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -44,6 +45,16 @@ public interface InternalNodeManager
     default Set<InternalNode> getCoordinators()
     {
         return getAllNodes().activeCoordinators();
+    }
+
+    /**
+     * Identity of the process currently running on the given node, if known.
+     * <p>
+     * Used to bind decisions that must not survive a node restart to the specific process that was observed.
+     */
+    default Optional<String> getNodeInstanceId(String nodeIdentifier)
+    {
+        return Optional.empty();
     }
 
     AllNodes getAllNodes();

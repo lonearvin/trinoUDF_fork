@@ -96,6 +96,9 @@ public class FaultTolerantPartitioningSchemeFactory
             if (bucketNodeMap.hasFixedMapping()) {
                 // fixed mappings have special handling in FTE to ensure that the required node assignments are respected
                 ToIntFunction<Split> splitToBucket = nodePartitioningManager.getSplitToBucket(session, partitioningHandle, bucketCount);
+                // the mapping is used directly as the set of nodes the stage runs on, so it must not point at
+                // nodes that are currently excluded from scheduling
+                nodePartitioningManager.checkFixedMappingSchedulable(bucketNodeMap.getFixedMapping());
                 return createFixedConnectorSpecificSchema(bucketNodeMap.getFixedMapping(), splitToBucket);
             }
         }

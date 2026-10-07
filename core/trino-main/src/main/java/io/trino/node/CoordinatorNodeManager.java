@@ -16,6 +16,7 @@ package io.trino.node;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Ticker;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -25,6 +26,7 @@ import com.google.inject.Inject;
 import io.airlift.http.client.HttpClient;
 import io.airlift.log.Logger;
 import io.airlift.node.NodeInfo;
+import io.trino.server.DynamicPluginNodeReadiness;
 import io.trino.server.NodeStateManager.CurrentNodeState;
 import io.trino.spi.HostAddress;
 import jakarta.annotation.PostConstruct;
@@ -35,6 +37,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -66,6 +69,7 @@ public final class CoordinatorNodeManager
     private final ScheduledExecutorService nodeStateUpdateExecutor;
     private final ExecutorService nodeStateEventExecutor;
     private final InternalNode currentNode;
+    private final DynamicPluginNodeReadiness dynamicPluginNodeReadiness;
     private final Ticker ticker;
 
     @GuardedBy("this")
@@ -73,6 +77,9 @@ public final class CoordinatorNodeManager
 
     @GuardedBy("this")
     private Set<InternalNode> invalidNodes;
+
+    @GuardedBy("this")
+    private Map<String, String> nodeInstanceIds = Map.of();
 
     @GuardedBy("this")
     private Map<HostAddress, InternalNode> goneNodes;
@@ -86,12 +93,14 @@ public final class CoordinatorNodeManager
             NodeInfo nodeInfo,
             InternalNode currentNode,
             CurrentNodeState currentNodeState,
+            DynamicPluginNodeReadiness dynamicPluginNodeReadiness,
             @ForNodeManager HttpClient httpClient)
     {
         this(nodeInventory,
                 currentNode,
                 currentNodeState,
                 nodeInfo.getEnvironment(),
+                dynamicPluginNodeReadiness,
                 httpClient,
                 Ticker.systemTicker());
     }
@@ -105,8 +114,29 @@ public final class CoordinatorNodeManager
             HttpClient httpClient,
             Ticker ticker)
     {
+        this(nodeInventory, currentNode, currentNodeState, expectedNodeEnvironment, permissiveReadiness(), httpClient, ticker);
+    }
+
+    private static DynamicPluginNodeReadiness permissiveReadiness()
+    {
+        DynamicPluginNodeReadiness readiness = new DynamicPluginNodeReadiness();
+        readiness.allowAllWorkers();
+        return readiness;
+    }
+
+    @VisibleForTesting
+    CoordinatorNodeManager(
+            NodeInventory nodeInventory,
+            InternalNode currentNode,
+            Supplier<NodeState> currentNodeState,
+            String expectedNodeEnvironment,
+            DynamicPluginNodeReadiness dynamicPluginNodeReadiness,
+            HttpClient httpClient,
+            Ticker ticker)
+    {
         this.nodeInventory = requireNonNull(nodeInventory, "nodeInventory is null");
         this.currentNode = requireNonNull(currentNode, "currentNode is null");
+        this.dynamicPluginNodeReadiness = requireNonNull(dynamicPluginNodeReadiness, "dynamicPluginNodeReadiness is null");
         this.currentNodeState = requireNonNull(currentNodeState, "currentNodeState is null");
         this.expectedNodeEnvironment = requireNonNull(expectedNodeEnvironment, "expectedNodeEnvironment is null");
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
@@ -195,6 +225,7 @@ public final class CoordinatorNodeManager
         ImmutableSet.Builder<InternalNode> shuttingDownNodesBuilder = ImmutableSet.builder();
         ImmutableSet.Builder<InternalNode> invalidNodesBuilder = ImmutableSet.builder();
         ImmutableSet.Builder<InternalNode> goneNodesBuilder = ImmutableSet.builder();
+        ImmutableMap.Builder<String, String> instanceIdsBuilder = ImmutableMap.builder();
 
         switch (currentNodeState.get()) {
             case ACTIVE -> activeNodesBuilder.add(currentNode);
@@ -210,6 +241,7 @@ public final class CoordinatorNodeManager
             if (node == null) {
                 continue;
             }
+            remoteNodeState.getNodeInstanceId().ifPresent(instanceId -> instanceIdsBuilder.put(node.getNodeIdentifier(), instanceId));
             switch (remoteNodeState.getState()) {
                 case ACTIVE -> activeNodesBuilder.add(node);
                 case INACTIVE -> inactiveNodesBuilder.add(node);
@@ -222,6 +254,7 @@ public final class CoordinatorNodeManager
         }
 
         this.invalidNodes = invalidNodesBuilder.build();
+        this.nodeInstanceIds = instanceIdsBuilder.buildKeepingLast();
         this.goneNodes = goneNodesBuilder.build().stream()
                 .collect(toImmutableMap(InternalNode::getHostAndPort, identity()));
 
@@ -245,6 +278,48 @@ public final class CoordinatorNodeManager
             List<Consumer<AllNodes>> listeners = ImmutableList.copyOf(this.listeners);
             nodeStateEventExecutor.submit(() -> listeners.forEach(listener -> listener.accept(allNodes)));
         }
+    }
+
+    @Override
+    public Set<InternalNode> getNodes(NodeState state)
+    {
+        Set<InternalNode> nodes = InternalNodeManager.super.getNodes(state);
+        if (state != NodeState.ACTIVE) {
+            return nodes;
+        }
+        return nodes.stream()
+                .filter(this::isSchedulable)
+                .collect(toImmutableSet());
+    }
+
+    /**
+     * A node may be selected for work when dynamic plugin readiness is disabled, when it is the coordinator,
+     * or when the process currently running on it has been verified to hold the coordinator's plugin set.
+     * The instance id check is what stops a restarted worker from reusing the readiness of its predecessor.
+     */
+    private boolean isSchedulable(InternalNode node)
+    {
+        if (node.isCoordinator()) {
+            return true;
+        }
+        String instanceId = nodeInstanceIds.get(node.getNodeIdentifier());
+        if (instanceId == null) {
+            // The node has never reported an instance id, so its plugin state cannot be verified
+            return !dynamicPluginNodeReadiness.isReadinessRequired();
+        }
+        return dynamicPluginNodeReadiness.isWorkerReady(node.getNodeIdentifier(), instanceId);
+    }
+
+    @Override
+    public synchronized Optional<String> getNodeInstanceId(String nodeIdentifier)
+    {
+        return Optional.ofNullable(nodeInstanceIds.get(requireNonNull(nodeIdentifier, "nodeIdentifier is null")));
+    }
+
+    @Override
+    public NodesSnapshot getActiveNodesSnapshot()
+    {
+        return new NodesSnapshot(getNodes(NodeState.ACTIVE));
     }
 
     @Override
@@ -294,6 +369,18 @@ public final class CoordinatorNodeManager
     {
         AllNodes allNodes = getAllNodes();
         return allNodes.activeNodes().size() - allNodes.activeCoordinators().size();
+    }
+
+    /**
+     * Workers that may currently receive work. This is lower than {@link #getActiveWorkerCount()} while a
+     * worker's dynamic plugin state has not been verified, or before a restarting worker is reconciled.
+     */
+    @Managed
+    public int getSchedulableWorkerCount()
+    {
+        return (int) getNodes(NodeState.ACTIVE).stream()
+                .filter(node -> !node.isCoordinator())
+                .count();
     }
 
     @VisibleForTesting

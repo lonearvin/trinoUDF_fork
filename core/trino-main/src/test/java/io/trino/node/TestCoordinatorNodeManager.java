@@ -22,18 +22,21 @@ import io.airlift.http.client.testing.TestingResponse;
 import io.airlift.json.JsonCodec;
 import io.airlift.testing.TestingTicker;
 import io.airlift.units.Duration;
+import io.trino.server.DynamicPluginNodeReadiness;
 import io.trino.server.ServerInfo;
 import io.trino.spi.NodeVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.net.URI;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static com.google.common.net.MediaType.JSON_UTF_8;
@@ -141,6 +144,158 @@ class TestCoordinatorNodeManager
             assertThat(inactiveNodes).containsExactlyInAnyOrderElementsOf(manager.getNodes(INACTIVE));
 
             assertThat(manager.getInvalidNodes()).containsExactlyInAnyOrderElementsOf(invalidNodes);
+        }
+        finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void testActiveWorkersAreFilteredUntilPluginReadiness()
+    {
+        DynamicPluginNodeReadiness readiness = new DynamicPluginNodeReadiness();
+        readiness.requireReadiness();
+        CoordinatorNodeManager manager = new CoordinatorNodeManager(
+                new TestingNodeInventory(),
+                copy(currentNode),
+                () -> ACTIVE,
+                EXPECTED_ENVIRONMENT,
+                readiness,
+                testHttpClient,
+                new TestingTicker());
+        try {
+            assertThat(manager.getAllNodes().activeNodes()).hasSize(4);
+            assertThat(manager.getNodes(ACTIVE)).containsExactly(coordinator);
+            assertThat(manager.getActiveNodesSnapshot().getAllNodes()).containsExactly(coordinator);
+
+            String readyWorkerId = activeNodes.stream()
+                    .filter(node -> !node.isCoordinator())
+                    .map(InternalNode::getNodeIdentifier)
+                    .filter(nodeId -> !nodeId.equals(currentNode.getNodeIdentifier()))
+                    .findFirst()
+                    .orElseThrow();
+
+            // Readiness recorded for a different process of the same node must not make it schedulable
+            readiness.markReady(readyWorkerId, "some-other-instance");
+            assertThat(manager.getNodes(ACTIVE)).containsExactly(coordinator);
+
+            String observedInstanceId = manager.getNodeInstanceId(readyWorkerId).orElseThrow();
+            readiness.markReady(readyWorkerId, observedInstanceId);
+
+            assertThat(manager.getNodes(ACTIVE))
+                    .extracting(InternalNode::getNodeIdentifier)
+                    .contains(readyWorkerId)
+                    .doesNotContain(currentNode.getNodeIdentifier());
+            assertThat(manager.getActiveNodesSnapshot().getAllNodes())
+                    .extracting(InternalNode::getNodeIdentifier)
+                    .contains(readyWorkerId);
+        }
+        finally {
+            manager.stop();
+        }
+    }
+
+    /**
+     * A worker keeps its node id when it restarts, but it runs as a new process with a new instance id.
+     * The readiness verified for the previous process must not keep the replacement schedulable, and the
+     * worker must become schedulable again once the coordinator verifies the new process.
+     */
+    @Test
+    void testRestartedWorkerLosesSchedulabilityUntilReconciled()
+    {
+        DynamicPluginNodeReadiness readiness = new DynamicPluginNodeReadiness();
+        readiness.requireReadiness();
+
+        InternalNode worker = activeNodes.stream()
+                .filter(node -> !node.isCoordinator())
+                .filter(node -> !node.getNodeIdentifier().equals(currentNode.getNodeIdentifier()))
+                .findFirst()
+                .orElseThrow();
+
+        AtomicReference<String> instanceId = new AtomicReference<>("instance-1");
+        Map<String, ServerInfo> otherHosts = new HashMap<>();
+        for (InternalNode node : activeNodes) {
+            if (!node.getNodeIdentifier().equals(worker.getNodeIdentifier())) {
+                otherHosts.put(node.getInternalUri().getHost(), toServerInfo(node, ACTIVE, EXPECTED_ENVIRONMENT));
+            }
+        }
+        TestingHttpClient client = new TestingHttpClient(input -> {
+            String host = input.getUri().getHost();
+            ServerInfo serverInfo = host.equals(worker.getInternalUri().getHost())
+                    ? new ServerInfo(
+                    worker.getNodeIdentifier(),
+                    instanceId.get(),
+                    ACTIVE,
+                    worker.getNodeVersion(),
+                    EXPECTED_ENVIRONMENT,
+                    false,
+                    Optional.empty(),
+                    false,
+                    Duration.ZERO)
+                    : otherHosts.get(host);
+            if (serverInfo == null) {
+                throw new IllegalArgumentException("Unknown host: " + host);
+            }
+            return new TestingResponse(
+                    OK,
+                    ImmutableListMultimap.of(CONTENT_TYPE, JSON_UTF_8.toString()),
+                    SERVER_INFO_JSON_CODEC.toJsonBytes(serverInfo));
+        });
+
+        TestingTicker ticker = new TestingTicker();
+        CoordinatorNodeManager manager = new CoordinatorNodeManager(
+                new TestingNodeInventory(),
+                copy(currentNode),
+                () -> ACTIVE,
+                EXPECTED_ENVIRONMENT,
+                readiness,
+                client,
+                ticker);
+        try {
+            // an unverified worker is not schedulable
+            assertThat(manager.getNodes(ACTIVE)).doesNotContain(worker);
+
+            readiness.markReady(worker.getNodeIdentifier(), "instance-1");
+            assertThat(manager.getNodes(ACTIVE)).contains(worker);
+
+            // the worker restarts with the same node id but a new process
+            instanceId.set("instance-2");
+            ticker.increment(5, SECONDS);
+            manager.refreshNodes(true);
+
+            assertThat(manager.getNodeInstanceId(worker.getNodeIdentifier())).contains("instance-2");
+            assertThat(manager.getNodes(ACTIVE)).doesNotContain(worker);
+
+            // once the coordinator has verified the new process, the worker is schedulable again
+            readiness.markReady(worker.getNodeIdentifier(), "instance-2");
+            assertThat(manager.getNodes(ACTIVE)).contains(worker);
+        }
+        finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void testWorkerWithoutReportedInstanceIdIsNotSchedulable()
+    {
+        DynamicPluginNodeReadiness readiness = new DynamicPluginNodeReadiness();
+        readiness.requireReadiness();
+        // The node manager cannot observe any process, so no worker's plugin state can be verified. The local
+        // node of this fixture is a worker, so nothing is schedulable: the check must fail closed.
+        CoordinatorNodeManager manager = new CoordinatorNodeManager(
+                new TestingNodeInventory(),
+                copy(currentNode),
+                () -> ACTIVE,
+                EXPECTED_ENVIRONMENT,
+                readiness,
+                new TestingHttpClient(_ -> {
+                    throw new UnsupportedOperationException("no node state available");
+                }),
+                new TestingTicker());
+        try {
+            assertThat(manager.getAllNodes().activeNodes()).isNotEmpty();
+            assertThat(manager.getNodes(ACTIVE)).isEmpty();
+            assertThat(manager.getActiveNodesSnapshot().getAllNodes()).isEmpty();
         }
         finally {
             manager.stop();
@@ -261,6 +416,7 @@ class TestCoordinatorNodeManager
     {
         return new ServerInfo(
                 inactiveNode.getNodeIdentifier(),
+                "instance-" + inactiveNode.getNodeIdentifier(),
                 nodeState,
                 inactiveNode.getNodeVersion(),
                 environment,
