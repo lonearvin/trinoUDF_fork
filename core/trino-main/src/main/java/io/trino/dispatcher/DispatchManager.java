@@ -36,6 +36,7 @@ import io.trino.execution.resourcegroups.ResourceGroupManager;
 import io.trino.metadata.SessionPropertyManager;
 import io.trino.security.AccessControl;
 import io.trino.server.BasicQueryInfo;
+import io.trino.server.DynamicPluginAdmission;
 import io.trino.server.SessionContext;
 import io.trino.server.SessionPropertyDefaults;
 import io.trino.server.SessionSupplier;
@@ -63,6 +64,7 @@ import static io.trino.execution.QueryState.FINISHING;
 import static io.trino.execution.QueryState.QUEUED;
 import static io.trino.execution.QueryState.RUNNING;
 import static io.trino.execution.QueryState.WAITING_FOR_RESOURCES;
+import static io.trino.spi.StandardErrorCode.QUERY_REJECTED;
 import static io.trino.spi.StandardErrorCode.QUERY_TEXT_TOO_LARGE;
 import static io.trino.tracing.ScopedSpan.scopedSpan;
 import static io.trino.util.Failures.toFailure;
@@ -95,6 +97,7 @@ public class DispatchManager
 
     private final QueryManagerStats stats = new QueryManagerStats();
     private final QueryMonitor queryMonitor;
+    private final DynamicPluginAdmission dynamicPluginAdmission;
     private final ScheduledExecutorService statsUpdaterExecutor;
 
     @Inject
@@ -111,7 +114,8 @@ public class DispatchManager
             Tracer tracer,
             QueryManagerConfig queryManagerConfig,
             DispatchExecutor dispatchExecutor,
-            QueryMonitor queryMonitor)
+            QueryMonitor queryMonitor,
+            DynamicPluginAdmission dynamicPluginAdmission)
     {
         this.queryIdGenerator = requireNonNull(queryIdGenerator, "queryIdGenerator is null");
         this.queryPreparer = requireNonNull(queryPreparer, "queryPreparer is null");
@@ -130,6 +134,7 @@ public class DispatchManager
 
         this.queryTracker = new QueryTracker<>(queryManagerConfig, dispatchExecutor.getScheduledExecutor());
         this.queryMonitor = requireNonNull(queryMonitor, "queryMonitor is null");
+        this.dynamicPluginAdmission = requireNonNull(dynamicPluginAdmission, "dynamicPluginAdmission is null");
         this.statsUpdaterExecutor = newSingleThreadScheduledExecutor(daemonThreadsNamed("dispatch-manager-stats-%s"));
     }
 
@@ -207,9 +212,14 @@ public class DispatchManager
      */
     private <C> void createQueryInternal(QueryId queryId, Span querySpan, Slug slug, SessionContext sessionContext, String query, ResourceGroupManager<C> resourceGroupManager)
     {
+        boolean admissionAcquired = dynamicPluginAdmission.tryAdmit(queryId);
+        boolean admissionTracked = false;
         Session session = null;
         PreparedQuery preparedQuery = null;
         try {
+            if (!admissionAcquired) {
+                throw new TrinoException(QUERY_REJECTED, "Query rejected while dynamic plugin state is changing or recovering; retry after the operation completes");
+            }
             if (query.length() > maxQueryLength) {
                 int queryLength = query.length();
                 query = query.substring(0, maxQueryLength);
@@ -251,6 +261,10 @@ public class DispatchManager
                     selectionContext.getResourceGroupId());
 
             boolean queryAdded = queryCreated(dispatchQuery);
+            if (queryAdded && admissionAcquired) {
+                trackQueryAdmission(dispatchQuery, queryId);
+                admissionTracked = true;
+            }
             if (queryAdded && !dispatchQuery.isDone()) {
                 try {
                     resourceGroupManager.submit(dispatchQuery, selectionContext, dispatchExecutor);
@@ -273,7 +287,11 @@ public class DispatchManager
             }
             Optional<String> preparedSql = Optional.ofNullable(preparedQuery).flatMap(PreparedQuery::getPrepareSql);
             DispatchQuery failedDispatchQuery = failedDispatchQueryFactory.createFailedDispatchQuery(session, query, preparedSql, Optional.empty(), throwable);
-            queryCreated(failedDispatchQuery);
+            boolean queryAdded = queryCreated(failedDispatchQuery);
+            if (queryAdded && admissionAcquired) {
+                trackQueryAdmission(failedDispatchQuery, queryId);
+                admissionTracked = true;
+            }
             // maintain proper order of calls such that EventListener has access to QueryInfo
             // - add query to tracker
             // - fire query created event
@@ -282,6 +300,23 @@ public class DispatchManager
             querySpan.setStatus(StatusCode.ERROR, throwable.getMessage())
                     .recordException(throwable)
                     .end();
+        }
+        finally {
+            if (admissionAcquired && !admissionTracked) {
+                dynamicPluginAdmission.release(queryId);
+            }
+        }
+    }
+
+    private void trackQueryAdmission(DispatchQuery dispatchQuery, QueryId queryId)
+    {
+        dispatchQuery.addStateChangeListener(newState -> {
+            if (newState.isDone()) {
+                dynamicPluginAdmission.release(queryId);
+            }
+        });
+        if (dispatchQuery.isDone()) {
+            dynamicPluginAdmission.release(queryId);
         }
     }
 
